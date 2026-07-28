@@ -84,6 +84,19 @@ fn trust_custom_server_registration_ack(host_prefix: &str) -> bool {
         || host_prefix.starts_with("103.205.240.70:")
 }
 
+fn rendezvous_union_name(msg: &Option<rendezvous_message::Union>) -> &'static str {
+    match msg {
+        Some(rendezvous_message::Union::RegisterPeerResponse(_)) => "RegisterPeerResponse",
+        Some(rendezvous_message::Union::RegisterPkResponse(_)) => "RegisterPkResponse",
+        Some(rendezvous_message::Union::TestNatResponse(_)) => "TestNatResponse",
+        Some(rendezvous_message::Union::RequestRelay(_)) => "RequestRelay",
+        Some(rendezvous_message::Union::PunchHoleRequest(_)) => "PunchHoleRequest",
+        Some(rendezvous_message::Union::ConfigureUpdate(_)) => "ConfigureUpdate",
+        Some(_) => "Other",
+        None => "None",
+    }
+}
+
 #[cfg(target_os = "android")]
 fn notify_android_needs_deploy() {
     if NOTIFIED_NEEDS_DEPLOY.load(Ordering::SeqCst) {
@@ -221,21 +234,15 @@ impl RendezvousMediator {
         let host = check_port(&host, RENDEZVOUS_PORT);
         log::info!("start udp: {host}");
         let (mut socket, mut addr) = new_udp_for(&host, CONNECT_TIMEOUT).await?;
+        if let Some(local_addr) = socket.local_addr() {
+            log::info!("rendezvous udp local addr for {host}: {local_addr}");
+        }
         let mut rz = Self {
             addr: addr.clone(),
             host: host.clone(),
             host_prefix: Self::get_host_prefix(&host),
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
         };
-        if trust_custom_server_registration_ack(&rz.host_prefix) {
-            log::info!(
-                "reset custom server key confirmation before registering {}",
-                rz.host_prefix
-            );
-            Config::set_key_confirmed(false);
-            Config::set_host_key_confirmed(&rz.host_prefix, false);
-        }
-
         let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
         const MIN_REG_TIMEOUT: i64 = 3_000;
         const MAX_REG_TIMEOUT: i64 = 30_000;
@@ -280,11 +287,24 @@ impl RendezvousMediator {
             select! {
                 n = socket.next() => {
                     match n {
-                        Some(Ok((bytes, _))) => {
+                        Some(Ok((bytes, from_addr))) => {
                             if let Ok(msg) = Message::parse_from_bytes(&bytes) {
+                                if trust_custom_server_registration_ack(&rz.host_prefix) {
+                                    log::info!(
+                                        "udp recv from {:?} for {}: len={}, type={}",
+                                        from_addr,
+                                        rz.host_prefix,
+                                        bytes.len(),
+                                        rendezvous_union_name(&msg.union)
+                                    );
+                                }
                                 rz.handle_resp(msg.union, Sink::Framed(&mut socket, &addr), &server, &mut update_latency).await?;
                             } else {
-                                log::debug!("Non-protobuf message bytes received: {:?}", bytes);
+                                log::debug!(
+                                    "Non-protobuf message bytes received from {:?}: {:?}",
+                                    from_addr,
+                                    bytes
+                                );
                             }
                         },
                         Some(Err(e)) => bail!("Failed to receive next: {}", e),  // maybe socks5 tcp disconnected
@@ -307,7 +327,12 @@ impl RendezvousMediator {
                     }
                     let now = Some(Instant::now());
                     let expired = last_register_resp.map(|x| x.elapsed().as_millis() as i64 >= REG_INTERVAL).unwrap_or(true);
-                    let timeout = last_register_sent.map(|x| x.elapsed().as_millis() as i64 >= reg_timeout).unwrap_or(false);
+                    let effective_reg_timeout = if trust_custom_server_registration_ack(&rz.host_prefix) {
+                        8_000
+                    } else {
+                        reg_timeout
+                    };
+                    let timeout = last_register_sent.map(|x| x.elapsed().as_millis() as i64 >= effective_reg_timeout).unwrap_or(false);
                     // temporarily disable exponential backoff for android before we add wakeup trigger to force connect in android
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     if crate::using_public_server() { // only turn on this for public server, may help DDNS self-hosting user.
@@ -793,19 +818,13 @@ impl RendezvousMediator {
         } else {
             *LAST_NOT_DEPLOYED_REGISTER.lock().await = None;
         }
-        let mut msg_out = Message::new();
         let pk = Config::get_key_pair().1;
         let uuid = hbb_common::get_uuid();
         let id = Config::get_id();
         let no_register_device = Config::no_register_device();
-        log::info!(
-            "send register_pk to {}: id={}, uuid_len={}, pk_len={}, no_register_device={}",
-            self.host_prefix,
-            id,
-            uuid.len(),
-            pk.len(),
-            no_register_device
-        );
+        let uuid_len = uuid.len();
+        let pk_len = pk.len();
+        let mut msg_out = Message::new();
         msg_out.set_register_pk(RegisterPk {
             id: id.clone(),
             uuid: uuid.into(),
@@ -813,6 +832,16 @@ impl RendezvousMediator {
             no_register_device,
             ..Default::default()
         });
+        let encoded_len = msg_out.compute_size();
+        log::info!(
+            "send register_pk to {}: id={}, uuid_len={}, pk_len={}, no_register_device={}, encoded_len={}",
+            self.host_prefix,
+            id,
+            uuid_len,
+            pk_len,
+            no_register_device,
+            encoded_len
+        );
         socket.send(&msg_out).await?;
         SENT_REGISTER_PK.store(true, Ordering::SeqCst);
         Ok(())
@@ -843,10 +872,12 @@ impl RendezvousMediator {
             return Ok(());
         }
         drop(solving);
+        let custom_unconfirmed = trust_custom_server_registration_ack(&self.host_prefix)
+            && (!Config::get_key_confirmed() || !Config::get_host_key_confirmed(&self.host_prefix));
         if !Config::get_key_confirmed() || !Config::get_host_key_confirmed(&self.host_prefix) {
             if trust_custom_server_registration_ack(&self.host_prefix) {
                 log::info!(
-                    "register peer before key confirmation for custom server {}",
+                    "register peer and pk before key confirmation for custom server {}",
                     self.host_prefix
                 );
             } else {
@@ -870,12 +901,17 @@ impl RendezvousMediator {
             serial,
             ..Default::default()
         });
+        let encoded_len = msg_out.compute_size();
         log::info!(
-            "register peer {} to custom rendezvous server {}",
+            "register peer {} to custom rendezvous server {}, encoded_len={}",
             id,
-            self.host_prefix
+            self.host_prefix,
+            encoded_len
         );
         socket.send(&msg_out).await?;
+        if custom_unconfirmed {
+            self.register_pk(socket).await?;
+        }
         Ok(())
     }
 
