@@ -56,8 +56,10 @@ pub(crate) static NEEDS_DEPLOY: AtomicBool = AtomicBool::new(false);
 static NOTIFIED_NEEDS_DEPLOY: AtomicBool = AtomicBool::new(false);
 // register_pk retry interval (ms) when device is awaiting deployment
 const DEPLOY_RETRY_INTERVAL: i64 = 30_000;
+const CUSTOM_REGISTER_PK_INTERVAL: i64 = 60_000;
 lazy_static::lazy_static! {
     static ref LAST_NOT_DEPLOYED_REGISTER: Mutex<Option<Instant>> = Mutex::new(None);
+    static ref LAST_CUSTOM_REGISTER_PK: Mutex<Option<Instant>> = Mutex::new(None);
 }
 
 // Single source of truth for the "awaiting deployment" backoff. The server has
@@ -76,6 +78,17 @@ async fn deploy_register_throttled() -> bool {
         .await
         .map(|t| (t.elapsed().as_millis() as i64) < DEPLOY_RETRY_INTERVAL)
         .unwrap_or(false)
+}
+
+async fn custom_register_pk_due() -> bool {
+    let mut last = LAST_CUSTOM_REGISTER_PK.lock().await;
+    let due = last
+        .map(|t| (t.elapsed().as_millis() as i64) >= CUSTOM_REGISTER_PK_INTERVAL)
+        .unwrap_or(true);
+    if due {
+        *last = Some(Instant::now());
+    }
+    due
 }
 
 fn trust_custom_server_registration_ack(host_prefix: &str) -> bool {
@@ -883,10 +896,12 @@ impl RendezvousMediator {
             return Ok(());
         }
         drop(solving);
-        let custom_unconfirmed = trust_custom_server_registration_ack(&self.host_prefix)
+        let custom_server = trust_custom_server_registration_ack(&self.host_prefix);
+        let custom_unconfirmed = custom_server
             && (!Config::get_key_confirmed() || !Config::get_host_key_confirmed(&self.host_prefix));
+        let custom_periodic_register_pk = custom_server && custom_register_pk_due().await;
         if !Config::get_key_confirmed() || !Config::get_host_key_confirmed(&self.host_prefix) {
-            if trust_custom_server_registration_ack(&self.host_prefix) {
+            if custom_server {
                 log::info!(
                     "register peer and pk before key confirmation for custom server {}",
                     self.host_prefix
@@ -920,7 +935,7 @@ impl RendezvousMediator {
             encoded_len
         );
         socket.send(&msg_out).await?;
-        if custom_unconfirmed {
+        if custom_unconfirmed || custom_periodic_register_pk {
             self.register_pk(socket).await?;
         }
         Ok(())
