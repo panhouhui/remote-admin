@@ -359,6 +359,15 @@ impl RendezvousMediator {
                 if rpr.request_pk {
                     log::info!("request_pk received from {}", self.host);
                     self.register_pk(sink).await?;
+                } else if trust_custom_server_registration_ack(&self.host_prefix) {
+                    log::info!(
+                        "register peer accepted by custom server {} without requesting pk",
+                        self.host_prefix
+                    );
+                    Config::set_key_confirmed(true);
+                    Config::set_host_key_confirmed(&self.host_prefix, true);
+                    *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
+                    NEEDS_DEPLOY.store(false, Ordering::SeqCst);
                 }
             }
             Some(rendezvous_message::Union::RegisterPkResponse(rpr)) => {
@@ -393,8 +402,12 @@ impl RendezvousMediator {
                         #[cfg(target_os = "android")]
                         notify_android_needs_deploy();
                     }
-                    _ => {
-                        log::error!("unknown RegisterPkResponse");
+                    other => {
+                        log::error!(
+                            "RegisterPkResponse from {} was not accepted: {:?}",
+                            self.host_prefix,
+                            other
+                        );
                     }
                 }
                 if rpr.keep_alive > 0 {
@@ -784,11 +797,20 @@ impl RendezvousMediator {
         let pk = Config::get_key_pair().1;
         let uuid = hbb_common::get_uuid();
         let id = Config::get_id();
+        let no_register_device = Config::no_register_device();
+        log::info!(
+            "send register_pk to {}: id={}, uuid_len={}, pk_len={}, no_register_device={}",
+            self.host_prefix,
+            id,
+            uuid.len(),
+            pk.len(),
+            no_register_device
+        );
         msg_out.set_register_pk(RegisterPk {
             id: id.clone(),
             uuid: uuid.into(),
             pk: pk.into(),
-            no_register_device: Config::no_register_device(),
+            no_register_device,
             ..Default::default()
         });
         socket.send(&msg_out).await?;
@@ -822,11 +844,18 @@ impl RendezvousMediator {
         }
         drop(solving);
         if !Config::get_key_confirmed() || !Config::get_host_key_confirmed(&self.host_prefix) {
-            log::info!(
-                "register_pk of {} due to key not confirmed",
-                self.host_prefix
-            );
-            return self.register_pk(socket).await;
+            if trust_custom_server_registration_ack(&self.host_prefix) {
+                log::info!(
+                    "register peer before key confirmation for custom server {}",
+                    self.host_prefix
+                );
+            } else {
+                log::info!(
+                    "register_pk of {} due to key not confirmed",
+                    self.host_prefix
+                );
+                return self.register_pk(socket).await;
+            }
         }
         let id = Config::get_id();
         log::trace!(
