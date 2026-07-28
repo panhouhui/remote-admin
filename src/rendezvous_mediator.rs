@@ -751,7 +751,7 @@ impl RendezvousMediator {
         Ok(())
     }
 
-    async fn register_pk(&mut self, socket: Sink<'_>) -> ResultType<()> {
+    async fn register_pk(&mut self, mut socket: Sink<'_>) -> ResultType<()> {
         // Throttle register_pk when the device is awaiting deployment: server
         // already told us we're not in its db; sending more often than every
         // DEPLOY_RETRY_INTERVAL ms is wasted traffic until the operator runs
@@ -772,7 +772,7 @@ impl RendezvousMediator {
         let uuid = hbb_common::get_uuid();
         let id = Config::get_id();
         msg_out.set_register_pk(RegisterPk {
-            id,
+            id: id.clone(),
             uuid: uuid.into(),
             pk: pk.into(),
             no_register_device: Config::no_register_device(),
@@ -789,6 +789,19 @@ impl RendezvousMediator {
             Config::update_latency(&self.host_prefix, 1);
             *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
             NEEDS_DEPLOY.store(false, Ordering::SeqCst);
+
+            let mut msg_peer = Message::new();
+            let serial = Config::get_serial();
+            msg_peer.set_register_peer(RegisterPeer {
+                id,
+                serial,
+                ..Default::default()
+            });
+            log::info!(
+                "register peer immediately after custom server key registration: {}",
+                self.host_prefix
+            );
+            socket.send(&msg_peer).await?;
         }
         SENT_REGISTER_PK.store(true, Ordering::SeqCst);
         Ok(())
@@ -809,7 +822,7 @@ impl RendezvousMediator {
         self.register_pk(socket).await
     }
 
-    async fn register_peer(&mut self, socket: Sink<'_>) -> ResultType<()> {
+    async fn register_peer(&mut self, mut socket: Sink<'_>) -> ResultType<()> {
         if trust_custom_server_registration_ack(&self.host_prefix) && Config::get_key_confirmed() {
             Config::set_host_key_confirmed(&self.host_prefix, true);
             Config::update_latency(&self.host_prefix, 1);
@@ -939,10 +952,10 @@ enum Sink<'a> {
 }
 
 impl Sink<'_> {
-    async fn send(self, msg: &Message) -> ResultType<()> {
+    async fn send(&mut self, msg: &Message) -> ResultType<()> {
         match self {
-            Sink::Framed(socket, addr) => socket.send(msg, addr.to_owned()).await,
-            Sink::Stream(stream) => stream.send(msg).await,
+            Sink::Framed(socket, addr) => (*socket).send(msg, addr.to_owned()).await,
+            Sink::Stream(stream) => (*stream).send(msg).await,
         }
     }
 }
