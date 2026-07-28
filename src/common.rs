@@ -1048,6 +1048,12 @@ pub fn get_api_server(api: String, custom: String) -> String {
     if Config::no_register_device() {
         return "".to_owned();
     }
+    if api.trim().eq_ignore_ascii_case("none") || api.trim() == "-" {
+        return "".to_owned();
+    }
+    if api.is_empty() && check_port(&custom, config::RENDEZVOUS_PORT) == "103.205.240.70:21116" {
+        return "".to_owned();
+    }
     let mut res = get_api_server_(api, custom);
     if res.ends_with('/') {
         res.pop();
@@ -2080,6 +2086,23 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
     ThrottledInterval::new(i)
 }
 
+const EMBEDDED_RENDEZVOUS_SERVER: &str = "103.205.240.70";
+const EMBEDDED_RELAY_SERVER: &str = "103.205.240.70";
+const EMBEDDED_SERVER_KEY: &str = "eQP92WzCA9JnUafEP2cWOxnrP9bh76mUhZa3iiAzTds=";
+
+fn apply_embedded_custom_client_defaults() {
+    let mut settings = config::OVERWRITE_SETTINGS.write().unwrap();
+    settings.insert(
+        keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
+        EMBEDDED_RENDEZVOUS_SERVER.to_owned(),
+    );
+    settings.insert(
+        keys::OPTION_RELAY_SERVER.to_owned(),
+        EMBEDDED_RELAY_SERVER.to_owned(),
+    );
+    settings.insert(keys::OPTION_KEY.to_owned(), EMBEDDED_SERVER_KEY.to_owned());
+}
+
 pub fn load_custom_client() {
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
@@ -2088,6 +2111,7 @@ pub fn load_custom_client() {
     }
     let Some(path) = std::env::current_exe().map_or(None, |x| x.parent().map(|x| x.to_path_buf()))
     else {
+        apply_embedded_custom_client_defaults();
         return;
     };
     #[cfg(target_os = "macos")]
@@ -2096,9 +2120,12 @@ pub fn load_custom_client() {
     if path.is_file() {
         let Ok(data) = std::fs::read_to_string(&path) else {
             log::error!("Failed to read custom client config");
+            apply_embedded_custom_client_defaults();
             return;
         };
         read_custom_client(&data.trim());
+    } else {
+        apply_embedded_custom_client_defaults();
     }
 }
 

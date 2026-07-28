@@ -7,6 +7,8 @@ vcpkg_add_to_path(${NASM_EXE_PATH})
 vcpkg_find_acquire_program(PERL)
 get_filename_component(PERL_PATH ${PERL} DIRECTORY)
 vcpkg_add_to_path(${PERL_PATH})
+get_filename_component(PERL_TOOL_ROOT "${PERL_PATH}/../.." ABSOLUTE)
+find_program(YASM NAMES yasm yasm.exe PATHS "${PERL_PATH}" "${PERL_TOOL_ROOT}/c/bin" NO_DEFAULT_PATH)
 
 if(DEFINED ENV{USE_AOM_391})
     vcpkg_from_git(
@@ -42,10 +44,16 @@ if(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm" AND VCPKG_TARGET_IS_LINUX)
   set(aom_target_cpu "-DENABLE_NEON=OFF")
 endif()
 
+set(aom_asm_compiler "")
+if(YASM)
+    set(aom_asm_compiler "-DCMAKE_ASM_NASM_COMPILER:FILEPATH=${YASM}")
+endif()
+
 vcpkg_cmake_configure(
     SOURCE_PATH ${SOURCE_PATH}
     OPTIONS
         ${aom_target_cpu}
+        ${aom_asm_compiler}
         -DENABLE_DOCS=OFF
         -DENABLE_EXAMPLES=OFF
         -DENABLE_TESTDATA=OFF

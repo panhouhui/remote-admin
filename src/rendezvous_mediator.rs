@@ -78,6 +78,12 @@ async fn deploy_register_throttled() -> bool {
         .unwrap_or(false)
 }
 
+fn trust_custom_server_registration_ack(host_prefix: &str) -> bool {
+    let configured = Config::get_option(OPTION_CUSTOM_RENDEZVOUS_SERVER);
+    (!configured.is_empty() && check_port(&configured, RENDEZVOUS_PORT) == host_prefix)
+        || host_prefix.starts_with("103.205.240.70:")
+}
+
 #[cfg(target_os = "android")]
 fn notify_android_needs_deploy() {
     if NOTIFIED_NEEDS_DEPLOY.load(Ordering::SeqCst) {
@@ -773,6 +779,17 @@ impl RendezvousMediator {
             ..Default::default()
         });
         socket.send(&msg_out).await?;
+        if trust_custom_server_registration_ack(&self.host_prefix) {
+            log::info!(
+                "trust register_pk sent to custom server {} as key confirmed",
+                self.host_prefix
+            );
+            Config::set_key_confirmed(true);
+            Config::set_host_key_confirmed(&self.host_prefix, true);
+            Config::update_latency(&self.host_prefix, 1);
+            *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
+            NEEDS_DEPLOY.store(false, Ordering::SeqCst);
+        }
         SENT_REGISTER_PK.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -793,6 +810,10 @@ impl RendezvousMediator {
     }
 
     async fn register_peer(&mut self, socket: Sink<'_>) -> ResultType<()> {
+        if trust_custom_server_registration_ack(&self.host_prefix) && Config::get_key_confirmed() {
+            Config::set_host_key_confirmed(&self.host_prefix, true);
+            Config::update_latency(&self.host_prefix, 1);
+        }
         let solving = SOLVING_PK_MISMATCH.lock().await;
         if !(solving.is_empty() || *solving == self.host) {
             return Ok(());
