@@ -844,6 +844,17 @@ impl RendezvousMediator {
         );
         socket.send(&msg_out).await?;
         SENT_REGISTER_PK.store(true, Ordering::SeqCst);
+        if trust_custom_server_registration_ack(&self.host_prefix) {
+            log::info!(
+                "assume register_pk delivered for custom server {}; mark key confirmed locally",
+                self.host_prefix
+            );
+            Config::set_key_confirmed(true);
+            Config::set_host_key_confirmed(&self.host_prefix, true);
+            Config::update_latency(&self.host_prefix, 1);
+            *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
+            NEEDS_DEPLOY.store(false, Ordering::SeqCst);
+        }
         Ok(())
     }
 
