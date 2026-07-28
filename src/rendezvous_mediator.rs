@@ -227,6 +227,14 @@ impl RendezvousMediator {
             host_prefix: Self::get_host_prefix(&host),
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
         };
+        if trust_custom_server_registration_ack(&rz.host_prefix) {
+            log::info!(
+                "reset custom server key confirmation before registering {}",
+                rz.host_prefix
+            );
+            Config::set_key_confirmed(false);
+            Config::set_host_key_confirmed(&rz.host_prefix, false);
+        }
 
         let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
         const MIN_REG_TIMEOUT: i64 = 3_000;
@@ -363,6 +371,11 @@ impl RendezvousMediator {
                         NEEDS_DEPLOY.store(false, Ordering::SeqCst);
                         #[cfg(target_os = "android")]
                         reset_needs_deploy_notification();
+                        log::info!(
+                            "register_pk accepted by {}; registering peer now",
+                            self.host_prefix
+                        );
+                        self.register_peer(sink).await?;
                     }
                     Ok(register_pk_response::Result::UUID_MISMATCH) => {
                         self.handle_uuid_mismatch(sink).await?;
@@ -779,30 +792,6 @@ impl RendezvousMediator {
             ..Default::default()
         });
         socket.send(&msg_out).await?;
-        if trust_custom_server_registration_ack(&self.host_prefix) {
-            log::info!(
-                "trust register_pk sent to custom server {} as key confirmed",
-                self.host_prefix
-            );
-            Config::set_key_confirmed(true);
-            Config::set_host_key_confirmed(&self.host_prefix, true);
-            Config::update_latency(&self.host_prefix, 1);
-            *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
-            NEEDS_DEPLOY.store(false, Ordering::SeqCst);
-
-            let mut msg_peer = Message::new();
-            let serial = Config::get_serial();
-            msg_peer.set_register_peer(RegisterPeer {
-                id,
-                serial,
-                ..Default::default()
-            });
-            log::info!(
-                "register peer immediately after custom server key registration: {}",
-                self.host_prefix
-            );
-            socket.send(&msg_peer).await?;
-        }
         SENT_REGISTER_PK.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -848,10 +837,15 @@ impl RendezvousMediator {
         let mut msg_out = Message::new();
         let serial = Config::get_serial();
         msg_out.set_register_peer(RegisterPeer {
-            id,
+            id: id.clone(),
             serial,
             ..Default::default()
         });
+        log::info!(
+            "register peer {} to custom rendezvous server {}",
+            id,
+            self.host_prefix
+        );
         socket.send(&msg_out).await?;
         Ok(())
     }
