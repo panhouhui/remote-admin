@@ -24,7 +24,7 @@ use hbb_common::{
     tokio::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpStream,
+        net::{TcpSocket, TcpStream},
         select,
         sync::Mutex,
         time::{interval, timeout},
@@ -55,6 +55,7 @@ lazy_static::lazy_static! {
     static ref LAST_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
     static ref LAST_RELAY_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
     static ref TCP_PROXY_PEER_CONN: Mutex<Option<TcpProxyConnection>> = Mutex::new(None);
+    static ref TCP_PROXY_PEER_BIND_ADDR: Mutex<Option<SocketAddr>> = Mutex::new(None);
 }
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static MANUAL_RESTARTED: AtomicBool = AtomicBool::new(false);
@@ -108,12 +109,36 @@ struct TcpProxyConnection {
 }
 
 async fn connect_tcp_proxy(proxy_addr: &str) -> ResultType<TcpProxyConnection> {
-    let stream = timeout(Duration::from_secs(5), TcpStream::connect(proxy_addr)).await??;
+    let bind_addr = *TCP_PROXY_PEER_BIND_ADDR.lock().await;
+    connect_tcp_proxy_with_bind(proxy_addr, bind_addr).await
+}
+
+async fn connect_tcp_proxy_with_bind(
+    proxy_addr: &str,
+    bind_addr: Option<SocketAddr>,
+) -> ResultType<TcpProxyConnection> {
+    let stream = if let Some(bind_addr) = bind_addr {
+        let proxy_socket_addr = tokio::net::lookup_host(proxy_addr)
+            .await?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("could not resolve tcp proxy {proxy_addr}"))?;
+        let socket = if proxy_socket_addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        socket.set_reuseaddr(true).ok();
+        socket.bind(bind_addr)?;
+        timeout(Duration::from_secs(5), socket.connect(proxy_socket_addr)).await??
+    } else {
+        timeout(Duration::from_secs(5), TcpStream::connect(proxy_addr)).await??
+    };
     let local_addr = stream.local_addr().ok();
     let peer_addr = stream.peer_addr().ok();
     log::info!(
-        "tcp proxy connected: addr={}, local_addr={:?}, peer_addr={:?}",
+        "tcp proxy connected: addr={}, bind_addr={:?}, local_addr={:?}, peer_addr={:?}",
         proxy_addr,
+        bind_addr,
         local_addr,
         peer_addr
     );
@@ -123,21 +148,10 @@ async fn connect_tcp_proxy(proxy_addr: &str) -> ResultType<TcpProxyConnection> {
     })
 }
 
-async fn ensure_tcp_proxy_connection(
-    conn_lock: &Mutex<Option<TcpProxyConnection>>,
-    proxy_addr: &str,
-) -> ResultType<Option<SocketAddr>> {
-    let mut guard = conn_lock.lock().await;
-    if guard
-        .as_ref()
-        .map(|conn| conn.addr.as_str() != proxy_addr)
-        .unwrap_or(true)
-    {
-        *guard = Some(connect_tcp_proxy(proxy_addr).await?);
-    }
-    Ok(guard
-        .as_ref()
-        .and_then(|conn| conn.stream.local_addr().ok()))
+fn random_ephemeral_port() -> u16 {
+    const START: u16 = 49152;
+    const COUNT: u16 = u16::MAX - START + 1;
+    START + (hbb_common::rand::random::<u16>() % COUNT)
 }
 
 async fn new_udp_for_tcp_proxy_port(
@@ -150,28 +164,73 @@ async fn new_udp_for_tcp_proxy_port(
     let Some(proxy_addr) = register_pk_tcp_proxy_addr(host_prefix) else {
         return Ok(None);
     };
-    let Some(proxy_local_addr) =
-        ensure_tcp_proxy_connection(&TCP_PROXY_PEER_CONN, &proxy_addr).await?
-    else {
-        return Ok(None);
-    };
     let target_addr = tokio::net::lookup_host(host)
         .await?
         .next()
         .ok_or_else(|| anyhow::anyhow!("could not resolve custom rendezvous host {host}"))?;
-    let mut udp_local_addr = Config::get_any_listen_addr(target_addr.is_ipv4());
-    udp_local_addr.set_port(proxy_local_addr.port());
-    log::info!(
-        "bind custom udp rendezvous socket to tcp proxy local port: host={}, proxy={}, udp_local={}, proxy_local={}",
-        host,
-        proxy_addr,
-        udp_local_addr,
-        proxy_local_addr
+    let target_addr_is_ipv4 = target_addr.is_ipv4();
+    let target_addr = target_addr.into_target_addr()?.to_owned();
+    let mut last_error = None;
+    for attempt in 1..=64 {
+        let mut udp_local_addr = Config::get_any_listen_addr(target_addr_is_ipv4);
+        udp_local_addr.set_port(random_ephemeral_port());
+        let socket = match FramedSocket::new_reuse(udp_local_addr, true, 0).await {
+            Ok(socket) => socket,
+            Err(err) => {
+                last_error = Some(format!("udp bind {udp_local_addr}: {err}"));
+                log::debug!(
+                    "custom tcp proxy port attempt {} skipped: {}",
+                    attempt,
+                    last_error.as_deref().unwrap_or("")
+                );
+                continue;
+            }
+        };
+        let Some(bound_udp_addr) = socket.local_addr() else {
+            last_error = Some(format!("udp bind {udp_local_addr}: missing local addr"));
+            continue;
+        };
+        match connect_tcp_proxy_with_bind(&proxy_addr, Some(bound_udp_addr)).await {
+            Ok(conn) => {
+                let proxy_local_addr = conn.stream.local_addr().ok();
+                if proxy_local_addr.map(|x| x.port()) != Some(bound_udp_addr.port()) {
+                    last_error = Some(format!(
+                        "tcp proxy local port {:?} did not match udp {}",
+                        proxy_local_addr, bound_udp_addr
+                    ));
+                    log::warn!(
+                        "custom tcp proxy port attempt {} rejected: {}",
+                        attempt,
+                        last_error.as_deref().unwrap_or("")
+                    );
+                    continue;
+                }
+                log::info!(
+                    "bind custom udp rendezvous socket and tcp proxy to same local port: host={}, proxy={}, udp_local={}, proxy_local={:?}, attempts={}",
+                    host,
+                    proxy_addr,
+                    bound_udp_addr,
+                    proxy_local_addr,
+                    attempt
+                );
+                *TCP_PROXY_PEER_BIND_ADDR.lock().await = Some(bound_udp_addr);
+                *TCP_PROXY_PEER_CONN.lock().await = Some(conn);
+                return Ok(Some((socket, target_addr)));
+            }
+            Err(err) => {
+                last_error = Some(format!("tcp bind/connect {bound_udp_addr}: {err}"));
+                log::debug!(
+                    "custom tcp proxy port attempt {} skipped: {}",
+                    attempt,
+                    last_error.as_deref().unwrap_or("")
+                );
+            }
+        }
+    }
+    bail!(
+        "could not bind udp and tcp proxy to the same local port after retries: {}",
+        last_error.unwrap_or_else(|| "no attempt succeeded".to_owned())
     );
-    Ok(Some((
-        FramedSocket::new_reuse(udp_local_addr, true, 0).await?,
-        target_addr.into_target_addr()?.to_owned(),
-    )))
 }
 
 async fn send_tcp_proxy_frame(
