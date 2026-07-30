@@ -2089,8 +2089,10 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
 const EMBEDDED_RENDEZVOUS_SERVER: &str = "103.205.240.70";
 const EMBEDDED_RELAY_SERVER: &str = "103.205.240.70";
 const EMBEDDED_SERVER_KEY: &str = "eQP92WzCA9JnUafEP2cWOxnrP9bh76mUhZa3iiAzTds=";
+const EMBEDDED_APP_NAME: &str = "\u{77b0}\u{57df}";
 
 fn apply_embedded_custom_client_defaults() {
+    *config::APP_NAME.write().unwrap() = EMBEDDED_APP_NAME.to_owned();
     let mut settings = config::OVERWRITE_SETTINGS.write().unwrap();
     settings.insert(
         keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
