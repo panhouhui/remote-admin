@@ -138,7 +138,7 @@ docker build -t "rustdesk-builder" . # 构建容器
    1. Dockerfile 中修改系统的源到国内镜像
       ```
       在Dockerfile的RUN apt update之前插入两行：
-   
+      
       RUN sed -i "s|deb.debian.org|mirrors.aliyun.com|g" /etc/apt/sources.list && \
           sed -i "s|security.debian.org|mirrors.aliyun.com|g" /etc/apt/sources.list
       ```

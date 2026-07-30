@@ -2086,8 +2086,8 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
     ThrottledInterval::new(i)
 }
 
-const EMBEDDED_RENDEZVOUS_SERVER: &str = "103.205.240.70:21116";
-const EMBEDDED_RELAY_SERVER: &str = "103.205.240.70:21117";
+const EMBEDDED_RENDEZVOUS_SERVER: &str = "103.205.240.70";
+const EMBEDDED_RELAY_SERVER: &str = "103.205.240.70";
 const EMBEDDED_SERVER_KEY: &str = "eQP92WzCA9JnUafEP2cWOxnrP9bh76mUhZa3iiAzTds=";
 
 fn apply_embedded_custom_client_defaults() {
@@ -2100,6 +2100,10 @@ fn apply_embedded_custom_client_defaults() {
         keys::OPTION_RELAY_SERVER.to_owned(),
         EMBEDDED_RELAY_SERVER.to_owned(),
     );
+    settings.insert(keys::OPTION_API_SERVER.to_owned(), "".to_owned());
+    settings.insert(keys::OPTION_DISABLE_UDP.to_owned(), "N".to_owned());
+    settings.insert(keys::OPTION_ALLOW_WEBSOCKET.to_owned(), "N".to_owned());
+    settings.insert("force-always-relay".to_owned(), "Y".to_owned());
     settings.insert(keys::OPTION_KEY.to_owned(), EMBEDDED_SERVER_KEY.to_owned());
 }
 
@@ -2309,6 +2313,7 @@ pub fn get_builtin_option(key: &str) -> String {
 #[inline]
 pub fn is_custom_client() -> bool {
     get_app_name() != "RustDesk"
+        || (!EMBEDDED_RENDEZVOUS_SERVER.is_empty() && !EMBEDDED_SERVER_KEY.is_empty())
 }
 
 pub fn verify_login(_raw: &str, _id: &str) -> bool {

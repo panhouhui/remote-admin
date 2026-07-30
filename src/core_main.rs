@@ -33,6 +33,15 @@ pub fn core_main() -> Option<Vec<String>> {
         return None;
     }
     crate::load_custom_client();
+    let early_args = std::env::args().skip(1).collect::<Vec<_>>();
+    if early_args.first().map(|x| x.as_str()) == Some("--test-register-pk") {
+        test_register_pk_cli(&early_args);
+        return None;
+    }
+    if early_args.first().map(|x| x.as_str()) == Some("--test-custom-online") {
+        test_custom_online_cli(&early_args);
+        return None;
+    }
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
         // return None to terminate the process
@@ -118,6 +127,14 @@ pub fn core_main() -> Option<Vec<String>> {
     #[cfg(feature = "flutter")]
     if _is_flutter_invoke_new_connection {
         return core_main_invoke_new_connection(std::env::args());
+    }
+    if args.first().map(|x| x.as_str()) == Some("--test-register-pk") {
+        test_register_pk_cli(&args);
+        return None;
+    }
+    if args.first().map(|x| x.as_str()) == Some("--test-custom-online") {
+        test_custom_online_cli(&args);
+        return None;
     }
     let click_setup = cfg!(windows) && args.is_empty() && crate::common::is_setup(&arg_exe);
     if click_setup && !config::is_disable_installation() {
@@ -760,6 +777,158 @@ pub fn core_main() -> Option<Vec<String>> {
     return Some(flutter_args);
     #[cfg(not(feature = "flutter"))]
     return Some(args);
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn test_register_pk_cli(args: &[String]) {
+    use hbb_common::{
+        config::Config,
+        protobuf::Message as _,
+        rendezvous_proto::{RegisterPk, RendezvousMessage},
+    };
+    use std::{net::UdpSocket, time::Duration};
+
+    let result = (|| -> hbb_common::ResultType<String> {
+        let host = args
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| Config::get_rendezvous_server());
+        let id = args.get(2).cloned().unwrap_or_else(Config::get_id);
+        let pk = Config::get_key_pair().1;
+        let uuid = hbb_common::get_uuid();
+        let no_register_device = Config::no_register_device();
+        let mut msg = RendezvousMessage::new();
+        msg.set_register_pk(RegisterPk {
+            id: id.clone(),
+            uuid: uuid.clone().into(),
+            pk: pk.clone().into(),
+            no_register_device,
+            ..Default::default()
+        });
+        let bytes = msg.write_to_bytes()?;
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let local = socket.local_addr()?;
+        let sent = socket.send_to(&bytes, &host)?;
+        let mut buf = [0u8; 2048];
+        let recv = match socket.recv_from(&mut buf) {
+            Ok((n, addr)) => format!("received_len={n} from={addr}"),
+            Err(err) => format!("received_error={err}"),
+        };
+        Ok(format!(
+            "host={host}\nid={id}\nuuid_len={}\npk_len={}\nno_register_device={no_register_device}\nlocal={local}\nwire_len={}\nsent={sent}\n{recv}\n",
+            uuid.len(),
+            pk.len(),
+            bytes.len(),
+        ))
+    })()
+    .unwrap_or_else(|err| format!("error={err}\n"));
+
+    let _ = std::fs::write("register_pk_test_result.txt", &result);
+    log::info!("register_pk test result: {}", result.replace('\n', "; "));
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn test_custom_online_cli(args: &[String]) {
+    use hbb_common::{
+        config::{Config, RENDEZVOUS_PORT},
+        protobuf::Message as _,
+        rendezvous_proto::{RegisterPeer, RegisterPk, RendezvousMessage},
+    };
+    use std::{
+        io::{Read, Write},
+        net::{TcpStream, UdpSocket},
+        time::{Duration, Instant},
+    };
+
+    let result = (|| -> hbb_common::ResultType<String> {
+        let host = args
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| "103.205.240.70:21116".to_owned());
+        let id = args.get(2).cloned().unwrap_or_else(Config::get_id);
+        let seconds = args
+            .get(3)
+            .and_then(|x| x.parse::<u64>().ok())
+            .unwrap_or(45);
+        let host = crate::check_port(&host, RENDEZVOUS_PORT);
+        let proxy = host
+            .rsplit_once(':')
+            .map(|(h, _)| format!("{h}:21120"))
+            .unwrap_or_else(|| "103.205.240.70:21120".to_owned());
+
+        let mut peer_msg = RendezvousMessage::new();
+        peer_msg.set_register_peer(RegisterPeer {
+            id: id.clone(),
+            serial: Config::get_serial(),
+            ..Default::default()
+        });
+        let peer_bytes = peer_msg.write_to_bytes()?;
+
+        let pk = Config::get_key_pair().1;
+        let uuid = hbb_common::get_uuid();
+        let mut pk_msg = RendezvousMessage::new();
+        pk_msg.set_register_pk(RegisterPk {
+            id: id.clone(),
+            uuid: uuid.clone().into(),
+            pk: pk.clone().into(),
+            no_register_device: Config::no_register_device(),
+            ..Default::default()
+        });
+        let pk_bytes = pk_msg.write_to_bytes()?;
+
+        let udp = UdpSocket::bind("0.0.0.0:0")?;
+        udp.set_read_timeout(Some(Duration::from_millis(900)))?;
+        let local = udp.local_addr()?;
+        let first_udp_sent = udp.send_to(&peer_bytes, &host)?;
+
+        let mut tcp = TcpStream::connect(&proxy)?;
+        tcp.set_read_timeout(Some(Duration::from_secs(5)))?;
+        tcp.set_write_timeout(Some(Duration::from_secs(5)))?;
+        tcp.write_all(&(pk_bytes.len() as u32).to_be_bytes())?;
+        tcp.write_all(&pk_bytes)?;
+        tcp.flush()?;
+        let mut proxy_buf = [0u8; 256];
+        let proxy_n = tcp.read(&mut proxy_buf).unwrap_or(0);
+        let proxy_response = String::from_utf8_lossy(&proxy_buf[..proxy_n])
+            .trim()
+            .to_owned();
+
+        let started = Instant::now();
+        let mut udp_sends = 1usize;
+        let mut udp_responses = Vec::new();
+        while started.elapsed() < Duration::from_secs(seconds) {
+            let sent = udp.send_to(&peer_bytes, &host)?;
+            udp_sends += 1;
+            let mut buf = [0u8; 2048];
+            match udp.recv_from(&mut buf) {
+                Ok((n, addr)) => {
+                    let msg_type = RendezvousMessage::parse_from_bytes(&buf[..n])
+                        .ok()
+                        .and_then(|msg| msg.union.map(|u| format!("{u:?}")))
+                        .unwrap_or_else(|| "non-protobuf".to_owned());
+                    udp_responses.push(format!(
+                        "recv_len={n} from={addr} type={msg_type} after_sent={sent}"
+                    ));
+                }
+                Err(err) => {
+                    udp_responses.push(format!("recv_error={err} after_sent={sent}"));
+                }
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        }
+
+        Ok(format!(
+            "host={host}\nproxy={proxy}\nid={id}\nudp_local={local}\nregister_peer_wire_len={}\nregister_pk_wire_len={}\nfirst_udp_sent={first_udp_sent}\ntcp_proxy_response={proxy_response}\nudp_sends={udp_sends}\nudp_responses=\n{}\n",
+            peer_bytes.len(),
+            pk_bytes.len(),
+            udp_responses.join("\n"),
+        ))
+    })()
+    .unwrap_or_else(|err| format!("error={err}\n"));
+
+    let _ = std::fs::write("custom_online_test_result.txt", &result);
+    log::info!("custom online test result: {}", result.replace('\n', "; "));
 }
 
 #[inline]

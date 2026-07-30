@@ -1,0 +1,17 @@
+[Unit]
+Description=RustDesk RegisterPk TCP proxy with spoofed UDP source
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rustdesk
+ExecStart=/usr/bin/python3 /opt/rustdesk/register_pk_tcp_proxy.py --listen 0.0.0.0 --port 21120 --udp-host 103.205.240.70 --udp-port 21116 --forward-mode raw-spoof
+Restart=always
+RestartSec=2
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

@@ -21,7 +21,14 @@ use hbb_common::{
     rendezvous_proto::*,
     sleep,
     socket_client::{self, connect_tcp, is_ipv4, new_direct_udp_for, new_udp_for},
-    tokio::{self, select, sync::Mutex, time::interval},
+    tokio::{
+        self,
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+        select,
+        sync::Mutex,
+        time::{interval, timeout},
+    },
     udp::FramedSocket,
     AddrMangle, IntoTargetAddr, ResultType, Stream, TargetAddr,
 };
@@ -47,6 +54,7 @@ lazy_static::lazy_static! {
     static ref SOLVING_PK_MISMATCH: Mutex<String> = Default::default();
     static ref LAST_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
     static ref LAST_RELAY_MSG: Mutex<(SocketAddr, Instant)> = Mutex::new((SocketAddr::new([0; 4].into(), 0), Instant::now()));
+    static ref TCP_PROXY_PEER_CONN: Mutex<Option<TcpProxyConnection>> = Mutex::new(None);
 }
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static MANUAL_RESTARTED: AtomicBool = AtomicBool::new(false);
@@ -82,6 +90,213 @@ fn trust_custom_server_registration_ack(host_prefix: &str) -> bool {
     let configured = Config::get_option(OPTION_CUSTOM_RENDEZVOUS_SERVER);
     (!configured.is_empty() && check_port(&configured, RENDEZVOUS_PORT) == host_prefix)
         || host_prefix.starts_with("103.205.240.70:")
+}
+
+fn register_pk_tcp_proxy_addr(host_prefix: &str) -> Option<String> {
+    if !trust_custom_server_registration_ack(host_prefix) {
+        return None;
+    }
+    let host = host_prefix
+        .rsplit_once(':')
+        .map_or(host_prefix, |(host, _)| host);
+    Some(format!("{host}:21120"))
+}
+
+struct TcpProxyConnection {
+    addr: String,
+    stream: TcpStream,
+}
+
+async fn connect_tcp_proxy(proxy_addr: &str) -> ResultType<TcpProxyConnection> {
+    let stream = timeout(Duration::from_secs(5), TcpStream::connect(proxy_addr)).await??;
+    let local_addr = stream.local_addr().ok();
+    let peer_addr = stream.peer_addr().ok();
+    log::info!(
+        "tcp proxy connected: addr={}, local_addr={:?}, peer_addr={:?}",
+        proxy_addr,
+        local_addr,
+        peer_addr
+    );
+    Ok(TcpProxyConnection {
+        addr: proxy_addr.to_owned(),
+        stream,
+    })
+}
+
+async fn ensure_tcp_proxy_connection(
+    conn_lock: &Mutex<Option<TcpProxyConnection>>,
+    proxy_addr: &str,
+) -> ResultType<Option<SocketAddr>> {
+    let mut guard = conn_lock.lock().await;
+    if guard
+        .as_ref()
+        .map(|conn| conn.addr.as_str() != proxy_addr)
+        .unwrap_or(true)
+    {
+        *guard = Some(connect_tcp_proxy(proxy_addr).await?);
+    }
+    Ok(guard
+        .as_ref()
+        .and_then(|conn| conn.stream.local_addr().ok()))
+}
+
+async fn new_udp_for_tcp_proxy_port(
+    host: &str,
+    host_prefix: &str,
+) -> ResultType<Option<(FramedSocket, TargetAddr<'static>)>> {
+    if Config::get_socks().is_some() {
+        return Ok(None);
+    }
+    let Some(proxy_addr) = register_pk_tcp_proxy_addr(host_prefix) else {
+        return Ok(None);
+    };
+    let Some(proxy_local_addr) =
+        ensure_tcp_proxy_connection(&TCP_PROXY_PEER_CONN, &proxy_addr).await?
+    else {
+        return Ok(None);
+    };
+    let target_addr = tokio::net::lookup_host(host)
+        .await?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve custom rendezvous host {host}"))?;
+    let mut udp_local_addr = Config::get_any_listen_addr(target_addr.is_ipv4());
+    udp_local_addr.set_port(proxy_local_addr.port());
+    log::info!(
+        "bind custom udp rendezvous socket to tcp proxy local port: host={}, proxy={}, udp_local={}, proxy_local={}",
+        host,
+        proxy_addr,
+        udp_local_addr,
+        proxy_local_addr
+    );
+    Ok(Some((
+        FramedSocket::new_reuse(udp_local_addr, true, 0).await?,
+        target_addr.into_target_addr()?.to_owned(),
+    )))
+}
+
+async fn send_tcp_proxy_frame(
+    stream: &mut TcpStream,
+    payload: &[u8],
+) -> ResultType<(String, bool)> {
+    let len = (payload.len() as u32).to_be_bytes();
+    timeout(Duration::from_secs(5), async {
+        stream.write_all(&len).await?;
+        stream.write_all(payload).await?;
+        stream.flush().await
+    })
+    .await??;
+
+    let mut response = Vec::with_capacity(512);
+    let mut buf = [0u8; 512];
+    let n = timeout(Duration::from_secs(5), stream.read(&mut buf)).await??;
+    if n == 0 {
+        bail!("tcp proxy closed connection without response");
+    }
+    response.extend_from_slice(&buf[..n]);
+    let mut closed = false;
+    loop {
+        match timeout(Duration::from_millis(80), stream.read(&mut buf)).await {
+            Ok(Ok(0)) => {
+                closed = true;
+                break;
+            }
+            Ok(Ok(n)) => response.extend_from_slice(&buf[..n]),
+            Ok(Err(err)) => return Err(err.into()),
+            Err(_) => break,
+        }
+    }
+    while matches!(response.first(), Some(0)) {
+        response.remove(0);
+    }
+    Ok((String::from_utf8_lossy(&response).trim().to_owned(), closed))
+}
+
+async fn send_payload_to_tcp_proxy(
+    conn_lock: &Mutex<Option<TcpProxyConnection>>,
+    kind: &str,
+    proxy_addr: &str,
+    id: &str,
+    payload: &[u8],
+) -> ResultType<()> {
+    let mut guard = conn_lock.lock().await;
+    let mut reused = true;
+    if guard
+        .as_ref()
+        .map(|conn| conn.addr.as_str() != proxy_addr)
+        .unwrap_or(true)
+    {
+        *guard = Some(connect_tcp_proxy(proxy_addr).await?);
+        reused = false;
+    }
+
+    let (response, closed) = if let Some(conn) = guard.as_mut() {
+        match send_tcp_proxy_frame(&mut conn.stream, payload).await {
+            Ok(result) => result,
+            Err(err) => {
+                let local_addr = conn.stream.local_addr().ok();
+                log::warn!(
+                    "{} tcp proxy send failed; reconnecting: addr={}, id={}, wire_len={}, reused={}, local_addr={:?}, error={}",
+                    kind,
+                    proxy_addr,
+                    id,
+                    payload.len(),
+                    reused,
+                    local_addr,
+                    err
+                );
+                *guard = Some(connect_tcp_proxy(proxy_addr).await?);
+                reused = false;
+                let conn = guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("tcp proxy reconnect missing stream"))?;
+                send_tcp_proxy_frame(&mut conn.stream, payload).await?
+            }
+        }
+    } else {
+        bail!("tcp proxy connection is not available");
+    };
+
+    let local_addr = guard
+        .as_ref()
+        .and_then(|conn| conn.stream.local_addr().ok());
+    log::info!(
+        "{} tcp proxy completed for {}: id={}, wire_len={}, reused={}, local_addr={:?}, closed={}, response={}",
+        kind,
+        proxy_addr,
+        id,
+        payload.len(),
+        reused,
+        local_addr,
+        closed,
+        response
+    );
+    if closed {
+        *guard = None;
+    }
+    Ok(())
+}
+
+async fn send_register_pk_to_tcp_proxy(
+    proxy_addr: &str,
+    id: &str,
+    payload: &[u8],
+) -> ResultType<()> {
+    send_payload_to_tcp_proxy(&TCP_PROXY_PEER_CONN, "register_pk", proxy_addr, id, payload).await
+}
+
+async fn send_register_peer_to_tcp_proxy(
+    proxy_addr: &str,
+    id: &str,
+    payload: &[u8],
+) -> ResultType<()> {
+    send_payload_to_tcp_proxy(
+        &TCP_PROXY_PEER_CONN,
+        "register_peer",
+        proxy_addr,
+        id,
+        payload,
+    )
+    .await
 }
 
 fn rendezvous_union_name(msg: &Option<rendezvous_message::Union>) -> &'static str {
@@ -233,14 +448,26 @@ impl RendezvousMediator {
     pub async fn start_udp(server: ServerPtr, host: String) -> ResultType<()> {
         let host = check_port(&host, RENDEZVOUS_PORT);
         log::info!("start udp: {host}");
-        let (mut socket, mut addr) = new_udp_for(&host, CONNECT_TIMEOUT).await?;
+        let host_prefix = Self::get_host_prefix(&host);
+        let (mut socket, mut addr) = match new_udp_for_tcp_proxy_port(&host, &host_prefix).await {
+            Ok(Some(socket)) => socket,
+            Ok(None) => new_udp_for(&host, CONNECT_TIMEOUT).await?,
+            Err(err) => {
+                log::warn!(
+                    "failed to bind udp to tcp proxy port for {}; falling back to normal udp: {}",
+                    host,
+                    err
+                );
+                new_udp_for(&host, CONNECT_TIMEOUT).await?
+            }
+        };
         if let Some(local_addr) = socket.local_addr() {
             log::info!("rendezvous udp local addr for {host}: {local_addr}");
         }
         let mut rz = Self {
             addr: addr.clone(),
             host: host.clone(),
-            host_prefix: Self::get_host_prefix(&host),
+            host_prefix,
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
         };
         let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
@@ -322,7 +549,9 @@ impl RendezvousMediator {
                     // DEPLOY_RETRY_INTERVAL elapses, otherwise the loop spins every
                     // few seconds (log spam + misapplied network-recovery rebind)
                     // until the operator runs `rustdesk --deploy`.
-                    if deploy_register_throttled().await {
+                    if !trust_custom_server_registration_ack(&rz.host_prefix)
+                        && deploy_register_throttled().await
+                    {
                         continue;
                     }
                     let now = Some(Instant::now());
@@ -523,10 +752,18 @@ impl RendezvousMediator {
                     if last_recv_msg.elapsed().as_millis() as u64 > rz.keep_alive as u64 * 3 / 2 {
                         bail!("Rendezvous connection is timeout");
                     }
-                    if (!Config::get_key_confirmed() ||
-                        !Config::get_host_key_confirmed(&rz.host_prefix)) &&
-                        last_register_sent.map(|x| x.elapsed().as_millis() as i64).unwrap_or(REG_INTERVAL) >= REG_INTERVAL {
+                    let custom_server = trust_custom_server_registration_ack(&rz.host_prefix);
+                    let register_due = last_register_sent
+                        .map(|x| x.elapsed().as_millis() as i64)
+                        .unwrap_or(REG_INTERVAL)
+                        >= REG_INTERVAL;
+                    if register_due &&
+                        (!Config::get_key_confirmed() ||
+                        !Config::get_host_key_confirmed(&rz.host_prefix)) {
                         rz.register_pk(Sink::Stream(&mut conn)).await?;
+                        last_register_sent = Some(Instant::now());
+                    } else if custom_server && register_due {
+                        rz.register_peer(Sink::Stream(&mut conn)).await?;
                         last_register_sent = Some(Instant::now());
                     }
                 }
@@ -537,6 +774,14 @@ impl RendezvousMediator {
 
     pub async fn start(server: ServerPtr, host: String) -> ResultType<()> {
         log::info!("start rendezvous mediator of {}", host);
+        let host_prefix = Self::get_host_prefix(&check_port(&host, RENDEZVOUS_PORT));
+        if trust_custom_server_registration_ack(&host_prefix) && !crate::is_udp_disabled() {
+            log::info!(
+                "force udp rendezvous mediator for custom server {}; bind udp port to tcp proxy and mirror register_pk/register_peer",
+                host
+            );
+            return Self::start_udp(server, host).await;
+        }
         //If the investment agent type is http or https, then tcp forwarding is enabled.
         if (cfg!(debug_assertions) && option_env!("TEST_TCP").is_some())
             || Config::is_proxy()
@@ -807,10 +1052,15 @@ impl RendezvousMediator {
         // already told us we're not in its db; sending more often than every
         // DEPLOY_RETRY_INTERVAL ms is wasted traffic until the operator runs
         // `rustdesk --deploy --token <api_token>`.
-        if NEEDS_DEPLOY.load(Ordering::SeqCst) {
+        let custom_server = trust_custom_server_registration_ack(&self.host_prefix);
+        if !custom_server && NEEDS_DEPLOY.load(Ordering::SeqCst) {
             let mut last = LAST_NOT_DEPLOYED_REGISTER.lock().await;
             if let Some(t) = *last {
                 if (t.elapsed().as_millis() as i64) < DEPLOY_RETRY_INTERVAL {
+                    log::info!(
+                        "skip register_pk to {} due to deploy retry throttle",
+                        self.host_prefix
+                    );
                     return Ok(());
                 }
             }
@@ -833,24 +1083,62 @@ impl RendezvousMediator {
             ..Default::default()
         });
         let encoded_len = msg_out.compute_size();
+        let payload = msg_out.write_to_bytes()?;
+        let wire_len = payload.len();
         log::info!(
-            "send register_pk to {}: id={}, uuid_len={}, pk_len={}, no_register_device={}, encoded_len={}",
+            "send register_pk to {}: id={}, uuid_len={}, pk_len={}, no_register_device={}, encoded_len={}, wire_len={}",
             self.host_prefix,
             id,
             uuid_len,
             pk_len,
             no_register_device,
-            encoded_len
+            encoded_len,
+            wire_len
         );
-        socket.send(&msg_out).await?;
-        log::info!(
-            "register_pk udp send completed for {}: id={}, encoded_len={}",
-            self.host_prefix,
-            id,
-            encoded_len
-        );
+        let skip_primary_register_pk = custom_server && socket.transport_name() == "tcp";
+        if skip_primary_register_pk {
+            log::info!(
+                "skip register_pk on tcp rendezvous for custom server {}; using tcp proxy only: id={}, encoded_len={}, wire_len={}",
+                self.host_prefix,
+                id,
+                encoded_len,
+                wire_len
+            );
+        } else {
+            socket.send(&msg_out).await?;
+            log::info!(
+                "register_pk {} send completed for {}: id={}, encoded_len={}, wire_len={}",
+                socket.transport_name(),
+                self.host_prefix,
+                id,
+                encoded_len,
+                wire_len
+            );
+        }
+        let mut tcp_proxy_ok = false;
+        if let Some(proxy_addr) = register_pk_tcp_proxy_addr(&self.host_prefix) {
+            log::info!(
+                "send register_pk to tcp proxy {}: id={}, wire_len={}",
+                proxy_addr,
+                id,
+                wire_len
+            );
+            if let Err(err) = send_register_pk_to_tcp_proxy(&proxy_addr, &id, &payload).await {
+                log::error!(
+                    "register_pk tcp proxy failed for {}: id={}, wire_len={}, error={}",
+                    proxy_addr,
+                    id,
+                    wire_len,
+                    err
+                );
+            } else {
+                tcp_proxy_ok = true;
+            }
+        }
         SENT_REGISTER_PK.store(true, Ordering::SeqCst);
-        if trust_custom_server_registration_ack(&self.host_prefix) {
+        if custom_server
+            && (tcp_proxy_ok || register_pk_tcp_proxy_addr(&self.host_prefix).is_none())
+        {
             log::info!(
                 "assume register_pk delivered for custom server {}; mark key confirmed locally",
                 self.host_prefix
@@ -860,6 +1148,13 @@ impl RendezvousMediator {
             Config::update_latency(&self.host_prefix, 1);
             *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
             NEEDS_DEPLOY.store(false, Ordering::SeqCst);
+            if tcp_proxy_ok {
+                log::info!(
+                    "refresh register_peer after tcp proxy register_pk for {}",
+                    self.host_prefix
+                );
+                self.send_register_peer_message(&mut socket).await?;
+            }
         }
         Ok(())
     }
@@ -906,6 +1201,21 @@ impl RendezvousMediator {
                 return self.register_pk(socket).await;
             }
         }
+        self.send_register_peer_message(&mut socket).await?;
+        if custom_unconfirmed || (custom_server && !SENT_REGISTER_PK.load(Ordering::SeqCst)) {
+            if custom_server && !custom_unconfirmed {
+                log::info!(
+                    "send startup register_pk once for custom server {} after register_peer delay",
+                    self.host_prefix
+                );
+                sleep(2.0).await;
+            }
+            self.register_pk(socket).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_register_peer_message(&self, socket: &mut Sink<'_>) -> ResultType<()> {
         let id = Config::get_id();
         log::trace!(
             "Register my id {:?} to rendezvous server {:?}",
@@ -920,21 +1230,50 @@ impl RendezvousMediator {
             ..Default::default()
         });
         let encoded_len = msg_out.compute_size();
+        let payload = msg_out.write_to_bytes()?;
+        let wire_len = payload.len();
         log::info!(
-            "register peer {} to custom rendezvous server {}, encoded_len={}",
+            "register peer {} to custom rendezvous server {}, encoded_len={}, wire_len={}, transport={}, local_addr={:?}",
             id,
             self.host_prefix,
-            encoded_len
+            encoded_len,
+            wire_len,
+            socket.transport_name(),
+            socket.local_addr()
         );
+        let transport = socket.transport_name();
         socket.send(&msg_out).await?;
-        if custom_server {
-            if !custom_unconfirmed {
+        if trust_custom_server_registration_ack(&self.host_prefix) {
+            log::info!(
+                "register peer send completed for {}: id={}, wire_len={}, transport={}",
+                self.host_prefix,
+                id,
+                wire_len,
+                transport
+            );
+            if transport == "tcp" {
                 log::info!(
-                    "refresh register_pk with every custom heartbeat for {}",
+                    "custom server register_peer uses persistent tcp rendezvous for {}; skip udp-spoof heartbeat",
                     self.host_prefix
                 );
+            } else if let Some(proxy_addr) = register_pk_tcp_proxy_addr(&self.host_prefix) {
+                log::info!(
+                    "send register_peer to tcp proxy fallback {}: id={}, wire_len={}",
+                    proxy_addr,
+                    id,
+                    wire_len
+                );
+                if let Err(err) = send_register_peer_to_tcp_proxy(&proxy_addr, &id, &payload).await
+                {
+                    log::error!(
+                        "register_peer tcp proxy fallback failed for {}: id={}, wire_len={}, error={}",
+                        proxy_addr,
+                        id,
+                        wire_len,
+                        err
+                    );
+                }
             }
-            self.register_pk(socket).await?;
         }
         Ok(())
     }
@@ -1035,6 +1374,20 @@ enum Sink<'a> {
 }
 
 impl Sink<'_> {
+    fn transport_name(&self) -> &'static str {
+        match self {
+            Sink::Framed(..) => "udp",
+            Sink::Stream(..) => "tcp",
+        }
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Sink::Framed(socket, _) => socket.local_addr(),
+            Sink::Stream(stream) => Some(stream.local_addr()),
+        }
+    }
+
     async fn send(&mut self, msg: &Message) -> ResultType<()> {
         match self {
             Sink::Framed(socket, addr) => (*socket).send(msg, addr.to_owned()).await,

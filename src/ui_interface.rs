@@ -589,23 +589,44 @@ pub fn check_mouse_time() {
 #[inline]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn get_connect_status() -> UiStatus {
-    UI_STATUS.lock().unwrap().clone()
+    let mut status = UI_STATUS.lock().unwrap().clone();
+    if status.status_num < 0 && crate::common::is_custom_client() {
+        let mut state = config::get_online_state();
+        if state > 0 {
+            state = 1;
+        }
+        if state > 0 {
+            status.status_num = state as _;
+        }
+    }
+    status
 }
 
 #[inline]
 pub fn temporary_password() -> String {
     #[cfg(any(target_os = "android", target_os = "ios"))]
-    return password_security::temporary_password();
+    return hbb_common::password_security::temporary_password();
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    return TEMPORARY_PASSWD.lock().unwrap().clone();
+    {
+        let password = TEMPORARY_PASSWD.lock().unwrap().clone();
+        if password.is_empty() && crate::common::is_custom_client() {
+            return hbb_common::password_security::temporary_password();
+        }
+        password
+    }
 }
 
 #[inline]
 pub fn update_temporary_password() {
     #[cfg(any(target_os = "android", target_os = "ios"))]
-    password_security::update_temporary_password();
+    hbb_common::password_security::update_temporary_password();
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    allow_err!(ipc::update_temporary_password());
+    {
+        if crate::common::is_custom_client() {
+            hbb_common::password_security::update_temporary_password();
+        }
+        allow_err!(ipc::update_temporary_password());
+    }
 }
 
 #[inline]
