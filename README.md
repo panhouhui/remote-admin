@@ -1,48 +1,28 @@
 <p align="center">
-  <img src="res/logo-header.svg" alt="瞰域 - 远程桌面"><br>
+  <img src="res/kanyu-logo.png" alt="瞰域" width="128"><br>
+  <b>瞰域</b><br>
+  <span>基于 RustDesk 二次开发的远程桌面客户端</span><br>
+  <a href="#快速开始">快速开始</a> ·
   <a href="#手动构建">手动构建</a> ·
   <a href="#使用-docker-构建">Docker 构建</a> ·
-  <a href="#文件结构">文件结构</a> ·
-  <a href="#截图">截图</a><br>
-  <b>欢迎帮助我们把这份说明文档、<a href="https://github.com/rustdesk/rustdesk/tree/master/src/lang">RustDesk 界面</a>和<a href="https://github.com/rustdesk/doc.rustdesk.com">RustDesk 文档</a>翻译成你的母语</b>
+  <a href="#目录结构">目录结构</a> ·
+  <a href="#截图">截图</a>
 </p>
 
 > [!Caution]
-> **免责声明：**<br>
-> 瞰域的开发者不支持任何不道德或违法的用途。未经授权的访问、控制或侵犯隐私等行为都违反我们的原则。作者不对任何滥用本程序的行为负责。
+> **使用说明：**瞰域仅用于合法授权的远程协助、设备维护和自建环境管理。请不要把它用于未经允许的访问、控制或监控场景。
 
-交流频道：[Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk) | [YouTube](https://www.youtube.com/@rustdesk)
+瞰域保留了 RustDesk 的核心连接与控制能力，同时把界面名称、图标、文案和默认分发方式整理成了自己的版本。它适合自建服务端、内网协助，以及需要统一品牌的二开场景。
 
-[![RustDesk Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-%E9%AB%98%E7%BA%A7%E5%8A%9F%E8%83%BD-blue)](https://rustdesk.com/pricing.html)
+如果你正在使用自建服务端，请确保客户端、转发节点和密钥配置一致；这样连接、注册和后续的中继过程才会稳定。
 
-瞰域是一个用 Rust 编写的远程桌面方案。它开箱即用，无需复杂配置。你可以完全掌控自己的数据，也无需担心安全问题。你可以使用我们的中继/转发服务器，也可以[自己搭建](https://rustdesk.com/server)，或者[编写属于你自己的中继/转发服务器](https://github.com/rustdesk/rustdesk-server-demo)。
+## 快速开始
 
-![示意图](https://user-images.githubusercontent.com/71636191/171661982-430285f0-2e12-4b1d-9957-4a58e375304d.png)
+1. 准备好你的服务端地址、转发地址和密钥。
+2. 启动客户端，在设置里填入对应信息。
+3. 保存后重新连接，即可开始使用。
 
-RustDesk 欢迎每个人参与贡献。想开始的话，请先阅读 [贡献指南](docs/CONTRIBUTING.md)。
-
-[**常见问题**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
-
-[**二进制下载**](https://github.com/rustdesk/rustdesk/releases)
-
-[**夜间构建**](https://github.com/rustdesk/rustdesk/releases/tag/nightly)
-
-[<img src="https://f-droid.org/badge/get-it-on.png"
-    alt="获取 F-Droid"
-    height="80">](https://f-droid.org/en/packages/com.carriez.flutter_hbb)
-[<img src="https://flathub.org/api/badge?svg&locale=en"
-    alt="获取 Flathub"
-    height="80">](https://flathub.org/apps/com.rustdesk.RustDesk)
-
-## 依赖
-
-桌面版可以使用 Flutter 或 Sciter（已弃用）作为图形界面。这里先说明 Sciter 的构建方式，因为它更容易上手。Flutter 版本的构建方法请参考我们的 [持续集成配置](https://github.com/rustdesk/rustdesk/blob/master/.github/workflows/flutter-build.yml)。
-
-请自行下载 Sciter 动态库：
-
-[Windows](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.win/x64/sciter.dll) |
-[Linux](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so) |
-[macOS](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.osx/libsciter.dylib)
+如果你只是想看怎么从源码打包，可以直接跳到下面的构建部分。
 
 ## 手动构建
 
@@ -52,7 +32,11 @@ RustDesk 欢迎每个人参与贡献。想开始的话，请先阅读 [贡献指
   - Linux/macOS：`vcpkg install libvpx libyuv opus aom`
 - 运行 `cargo run`
 
-## [构建文档](https://rustdesk.com/docs/en/dev/build/)
+## 构建文档
+
+桌面端目前以 Flutter 为主，Sciter 相关目录保留给历史兼容和参考。更完整的构建说明可以继续参考上游的持续集成配置：
+
+https://github.com/rustdesk/rustdesk/blob/master/.github/workflows/flutter-build.yml
 
 ## 在 Linux 上构建
 
@@ -112,8 +96,8 @@ cd
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
-git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
+git clone <你的仓库地址>
+cd <仓库目录>
 mkdir -p target/debug
 wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so
 mv libsciter-gtk.so target/debug
@@ -125,22 +109,22 @@ VCPKG_ROOT=$HOME/vcpkg cargo run
 先克隆仓库并构建 Docker 镜像：
 
 ```sh
-git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
+git clone <你的仓库地址>
+cd <仓库目录>
 git submodule update --init --recursive
-docker build -t "rustdesk-builder" .
+docker build -t "kanyu-builder" .
 ```
 
-如果你在国内网络环境下构建，可以考虑下面几项优化：
+如果你在国内网络环境下构建，可以按需做下面几项优化：
 
-1. 在 `Dockerfile` 里把系统源换成国内镜像
+1. 把系统源换成国内镜像
 
    ```Dockerfile
    RUN sed -i "s|deb.debian.org|mirrors.aliyun.com|g" /etc/apt/sources.list && \
        sed -i "s|security.debian.org|mirrors.aliyun.com|g" /etc/apt/sources.list
    ```
 
-2. 在容器里修改 Cargo 源
+2. 修改 Cargo 源
 
    ```Dockerfile
    RUN echo '[source.crates-io]' > ~/.cargo/config \
@@ -160,10 +144,10 @@ docker build -t "rustdesk-builder" .
    ENV https_proxy=http://host:port
    ```
 
-4. 在 `docker build` 命令后追加代理参数
+4. 在 `docker build` 命令里追加代理参数
 
    ```sh
-   docker build -t "rustdesk-builder" . --build-arg http_proxy=http://host:port --build-arg https_proxy=http://host:port
+   docker build -t "kanyu-builder" . --build-arg http_proxy=http://host:port --build-arg https_proxy=http://host:port
    ```
 
 ### 构建程序
@@ -171,14 +155,14 @@ docker build -t "rustdesk-builder" .
 之后每次需要构建应用时，运行：
 
 ```sh
-docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user/.cargo/git -v rustdesk-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" rustdesk-builder
+docker run --rm -it -v $PWD:/home/user/rustdesk -v kanyu-git-cache:/home/user/.cargo/git -v kanyu-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" kanyu-builder
 ```
 
 注意：
 
-- 第一次构建通常会比较慢，因为依赖需要先缓存下来；后续构建会快很多。
-- 如果你要传入不同的构建参数，可以把参数追加在命令末尾 `<可选参数>` 的位置。比如构建优化过的发布版，只需在上面的命令后面加上 `--release`。
-- 生成的可执行文件会在你系统的 `target` 目录里。
+- 第一次构建通常会比较慢，因为依赖需要先缓存下来，后续构建会快很多。
+- 如果你要传入不同的构建参数，可以把参数追加在命令末尾；例如构建发布版，只需再加上 `--release`。
+- 生成的可执行文件会放在你本机的 `target` 目录里。
 - 如果看到下面这类提示，可以尝试去掉 `-e PUID="$(id -u)" -e PGID="$(id -g)"`：
 
   ```text
@@ -187,37 +171,37 @@ docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user
   groupmod: cannot lock /etc/group; try again later.
   ```
 
-  原因是容器的入口脚本会检查 UID 和 GID；当它们与指定的环境变量不一致时，会尝试强制修改 `user` 的 UID/GID 并重新运行。但重启后如果仍然读不到环境变量里的 UID/GID，就可能再次报错。
+  原因是容器入口脚本会检查 UID 和 GID；当它们与指定的环境变量不一致时，会尝试修改 `user` 的 UID/GID 并重新运行。重启后如果仍然读不到环境变量里的 UID/GID，就可能再次报错。
 
 ### 运行程序
 
-生成的可执行文件位于 `target` 目录下，可以直接运行调试版：
+生成的可执行文件位于 `target` 目录下，可直接运行调试版：
 
 ```sh
-target/debug/rustdesk
+target/debug/瞰域
 ```
 
-也可以运行发布版：
+或者运行发布版：
 
 ```sh
-target/release/rustdesk
+target/release/瞰域
 ```
 
 注意：
 
-- 请确保在 RustDesk 仓库根目录下运行这些命令，否则程序可能找不到所需资源。
-- `install`、`run` 等其他 Cargo 子命令目前不支持通过这种方式在容器里执行，因为那样只会把程序安装或运行在容器里，而不是宿主机上。
+- 请确保在仓库根目录下运行这些命令，否则程序可能找不到所需资源。
+- `install`、`run` 等其他 Cargo 子命令目前不建议通过这种方式在容器里执行，因为那样只会把程序安装或运行在容器中，而不是宿主机上。
 
-## 文件结构
+## 目录结构
 
-- **[libs/hbb_common](https://github.com/rustdesk/rustdesk/tree/master/libs/hbb_common)**：视频编解码、配置、TCP/UDP 封装、protobuf、文件传输相关的文件系统操作，以及其他工具函数
+- **[libs/hbb_common](https://github.com/rustdesk/rustdesk/tree/master/libs/hbb_common)**：视频编解码、配置、TCP/UDP 封装、protobuf、文件传输相关的文件系统操作，以及其他通用工具函数
 - **[libs/scrap](https://github.com/rustdesk/rustdesk/tree/master/libs/scrap)**：屏幕采集
-- **[libs/enigo](https://github.com/rustdesk/rustdesk/tree/master/libs/enigo)**：平台相关的键盘/鼠标控制
-- **[libs/clipboard](https://github.com/rustdesk/rustdesk/tree/master/libs/clipboard)**：Windows、Linux、macOS 的文件复制与粘贴实现
+- **[libs/enigo](https://github.com/rustdesk/rustdesk/tree/master/libs/enigo)**：平台相关的键盘和鼠标控制
+- **[libs/clipboard](https://github.com/rustdesk/rustdesk/tree/master/libs/clipboard)**：Windows、Linux、macOS 的文件复制和粘贴实现
 - **[src/ui](https://github.com/rustdesk/rustdesk/tree/master/src/ui)**：旧的 Sciter 界面（已弃用）
 - **[src/server](https://github.com/rustdesk/rustdesk/tree/master/src/server)**：音频、剪贴板、输入、视频服务，以及网络连接
-- **[src/client.rs](https://github.com/rustdesk/rustdesk/tree/master/src/client.rs)**：发起一个对等连接
-- **[src/rendezvous_mediator.rs](https://github.com/rustdesk/rustdesk/tree/master/src/rendezvous_mediator.rs)**：与 [rustdesk-server](https://github.com/rustdesk/rustdesk-server) 通信，等待远程直连（TCP 打洞）或中继连接
+- **[src/client.rs](https://github.com/rustdesk/rustdesk/tree/master/src/client.rs)**：发起对等连接
+- **[src/rendezvous_mediator.rs](https://github.com/rustdesk/rustdesk/tree/master/src/rendezvous_mediator.rs)**：与服务端协调注册、直连和中继连接
 - **[src/platform](https://github.com/rustdesk/rustdesk/tree/master/src/platform)**：平台相关代码
 - **[flutter](https://github.com/rustdesk/rustdesk/tree/master/flutter)**：桌面端和移动端的 Flutter 代码
 - **[flutter/web/js](https://github.com/rustdesk/rustdesk/tree/master/flutter/web/v1/js)**：Flutter Web 客户端使用的 JavaScript
